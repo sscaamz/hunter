@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dot
+dot
 """
 
 import os
@@ -50,9 +50,9 @@ CHAINS = {
 }
 
 SWEEP_ENABLED = True
-MAX_COMMITS_PER_RUN = 350
-MAX_ADDRESSES_PER_RUN = 300
-FETCH_WORKERS = 10
+MAX_COMMITS_PER_RUN = 1200
+MAX_ADDRESSES_PER_RUN = 400
+FETCH_WORKERS = 12
 CHECK_WORKERS = 6
 RUN_BUDGET_SEC = 780
 MIN_COMMITS_BEFORE_FALLBACK = 60
@@ -61,7 +61,7 @@ ARCHIVE_HOSTS = [
     "https://gharchive.open-digger.net/",
     "https://data.gharchive.org/",
 ]
-ARCHIVE_OFFSETS = (2, 3)
+ARCHIVE_OFFSETS = (2, 3, 4)
 
 SEARCH_QUERIES = [
     "PRIVATE_KEY= in:file",
